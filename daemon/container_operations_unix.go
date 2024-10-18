@@ -26,6 +26,28 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func WriteFileSync(name string, data []byte, perm os.FileMode) error {
+	// writing config/secret involves mounting/remounting tmpfs a lot
+	// this ensures the underlying system is synced
+	// this is go std implementation +plus+ a sync
+
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+	}
+
+	return err
+}
+
 func (daemon *Daemon) setupLinkedContainers(ctr *container.Container) ([]string, error) {
 	var env []string
 	children := daemon.children(ctr)
@@ -240,7 +262,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 		if err != nil {
 			return errors.Wrap(err, "unable to get secret from secret store")
 		}
-		if err := os.WriteFile(fPath, secret.Spec.Data, s.File.Mode); err != nil {
+		if err := WriteFileSync(fPath, secret.Spec.Data, s.File.Mode); err != nil {
 			return errors.Wrap(err, "error injecting secret")
 		}
 
@@ -291,7 +313,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 		if err != nil {
 			return errors.Wrap(err, "unable to get config from config store")
 		}
-		if err := os.WriteFile(fPath, config.Spec.Data, configRef.File.Mode); err != nil {
+		if err := WriteFileSync(fPath, config.Spec.Data, configRef.File.Mode); err != nil {
 			return errors.Wrap(err, "error injecting config")
 		}
 
