@@ -3,12 +3,15 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/containerd/log"
 	"github.com/docker/docker/container"
@@ -25,28 +28,6 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/sys/unix"
 )
-
-func WriteFileSync(name string, data []byte, perm os.FileMode) error {
-	// writing config/secret involves mounting/remounting tmpfs a lot
-	// this ensures the underlying system is synced
-	// this is go std implementation +plus+ a sync
-
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(data)
-
-	if err := f.Sync(); err != nil {
-		return err
-	}
-
-	if err1 := f.Close(); err1 != nil && err == nil {
-		err = err1
-	}
-
-	return err
-}
 
 func (daemon *Daemon) setupLinkedContainers(ctr *container.Container) ([]string, error) {
 	var env []string
@@ -262,7 +243,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 		if err != nil {
 			return errors.Wrap(err, "unable to get secret from secret store")
 		}
-		if err := WriteFileSync(fPath, secret.Spec.Data, s.File.Mode); err != nil {
+		if err := os.WriteFile(fPath, secret.Spec.Data, s.File.Mode); err != nil {
 			return errors.Wrap(err, "error injecting secret")
 		}
 
@@ -313,7 +294,7 @@ func (daemon *Daemon) setupSecretDir(ctr *container.Container) (setupErr error) 
 		if err != nil {
 			return errors.Wrap(err, "unable to get config from config store")
 		}
-		if err := WriteFileSync(fPath, config.Spec.Data, configRef.File.Mode); err != nil {
+		if err := os.WriteFile(fPath, config.Spec.Data, configRef.File.Mode); err != nil {
 			return errors.Wrap(err, "error injecting config")
 		}
 
@@ -364,18 +345,69 @@ func (daemon *Daemon) remountSecretDir(ctr *container.Container) error {
 	if err != nil {
 		return errors.Wrap(err, "error getting container secrets path")
 	}
+
 	if err := label.Relabel(dir, ctr.MountLabel, false); err != nil {
-		log.G(context.TODO()).WithError(err).WithField("dir", dir).Warn("Error while attempting to set selinux label")
+		log.G(context.TODO()).WithError(err).WithField("dir", dir).Warn("Error while attempting to set SELinux label")
 	}
+
 	rootIDs := daemon.idMapping.RootPair()
 	tmpfsOwnership := fmt.Sprintf("uid=%d,gid=%d", rootIDs.UID, rootIDs.GID)
 
-	// remount secrets ro
-	if err := mount.Mount("tmpfs", dir, "tmpfs", "remount,ro,"+tmpfsOwnership); err != nil {
-		return errors.Wrap(err, "unable to remount dir as readonly")
-	}
+	// Include all original mount options
+	mountOptions := "remount,ro,nodev,nosuid,noexec," + tmpfsOwnership
 
-	return nil
+	log.G(context.TODO()).WithFields(log.Fields{
+		"directory":    dir,
+		"mountOptions": mountOptions,
+	}).Debug("Attempting to remount secrets directory as read-only")
+
+	maxRetries := 5
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		err := mount.Mount("tmpfs", dir, "tmpfs", mountOptions)
+		if err == nil {
+			log.G(context.TODO()).WithField("attempt", i+1).Debug("Successfully remounted secrets directory as read-only")
+			return nil
+		}
+
+		if !errors.Is(err, syscall.EBUSY) {
+			// If the error is not EBUSY, retrying won't help
+			log.G(context.TODO()).WithError(err).Error("Failed to remount secrets directory")
+			return errors.Wrap(err, "unable to remount dir as readonly")
+		}
+
+		// Log the error and attempt to capture lsof output
+		log.G(context.TODO()).WithFields(log.Fields{
+			"attempt": i + 1,
+			"error":   err,
+		}).Warn("Remount failed with EBUSY; will retry after delay")
+
+		// Capture lsof output
+		lsofOutput, lsofErr := getLsofOutput(dir)
+		if lsofErr != nil {
+			log.G(context.TODO()).WithError(lsofErr).Error("Failed to execute lsof")
+		} else {
+			log.G(context.TODO()).WithField("lsofOutput", lsofOutput).Warn("lsof output for secrets directory")
+		}
+
+		// Wait before retrying
+		time.Sleep(100 * time.Millisecond)
+		lastErr = err
+	}
+	return errors.Wrap(lastErr, "unable to remount dir as readonly after retries")
+}
+
+// getLsofOutput executes 'lsof +D <dir>' and returns its output
+func getLsofOutput(dir string) (string, error) {
+	cmd := exec.Command("lsof", "+D", dir)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out // Capture stderr in case of errors
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return out.String(), nil
 }
 
 func (daemon *Daemon) cleanupSecretDir(ctr *container.Container) {
