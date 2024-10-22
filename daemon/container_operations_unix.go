@@ -399,14 +399,12 @@ func (daemon *Daemon) remountSecretDir(ctr *container.Container) error {
 
 // getLsofOutput executes 'lsof +D <dir>' and returns its output
 func getLsofOutput(dir string) (string, error) {
-	cmd := exec.Command("lsof", "+D", dir)
+	cmd := exec.Command("lsof", "+VD", dir)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out // Capture stderr in case of errors
 
-	if err := cmd.Run(); err != nil {
-		return "", err
-	}
+	cmd.Run()
 	return out.String(), nil
 }
 
